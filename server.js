@@ -59,16 +59,27 @@ async function decreaseVariantStock(variantGid, decreaseAmount) {
         }
     `;
 
-  const readResponse = await axios.post(
-    ADMIN_GRAPHQL_URL,
-    { query: readQuery, variables: { id: variantGid } },
-    {
-      headers: {
-        "Content-Type": "application/json",
-        "X-Shopify-Access-Token": SHOPIFY_ADMIN_ACCESS_TOKEN,
-      },
+  // Helper to handle API requests with retry logic (omitted for brevity)
+  const executeAdminQuery = async (query, variables) => {
+    try {
+      return await axios.post(
+        ADMIN_GRAPHQL_URL,
+        { query, variables },
+        {
+          headers: {
+            "Content-Type": "application/json",
+            "X-Shopify-Access-Token": SHOPIFY_ADMIN_ACCESS_TOKEN,
+          },
+        }
+      );
+    } catch (e) {
+      console.error("Admin API Error:", e.response?.data?.errors || e.message);
+      throw new Error("Failed to communicate with Shopify Admin API.");
     }
-  );
+  };
+
+
+  const readResponse = await executeAdminQuery(readQuery, { id: variantGid });
 
   console.log({ readResponse: readResponse.data.data?.productVariant });
 
@@ -79,8 +90,9 @@ async function decreaseVariantStock(variantGid, decreaseAmount) {
     throw new Error("Product variant not found using GID.");
   }
   if (!currentMetafield) {
+    // If metafield doesn't exist, we can't decrease it. Assuming the stock must be initialized.
     throw new Error(
-      `Metafield '${METADATA_NAMESPACE}.${METADATA_KEY}' not found on this variant.`
+      `Metafield '${METADATA_NAMESPACE}.${METADATA_KEY}' not found on this variant. Cannot proceed with decrease.`
     );
   }
 
@@ -98,6 +110,8 @@ async function decreaseVariantStock(variantGid, decreaseAmount) {
   }
 
   // --- STEP 2: WRITE the new metafield value (Admin API) ---
+  // Note: We use metafieldsSet which creates or updates a metafield based on
+  // ownerId, namespace, and key. It does NOT accept the metafield's GID ('id') in the input.
   const writeMutation = `
   mutation metafieldsSet($metafields: [MetafieldsSetInput!]!) {
     metafieldsSet(metafields: $metafields) {
@@ -115,33 +129,22 @@ async function decreaseVariantStock(variantGid, decreaseAmount) {
 
   console.log({ newStock, currentMetafield, variantData });
 
-  const writeResponse = await axios.post(
-    ADMIN_GRAPHQL_URL,
-    {
-      query: writeMutation,
-      variables: {
-        metafields: [
-          {
-            ownerId: variantData.id,
-            namespace: "custom",
-            key: "store_stock",
-            id: currentMetafield.id, // Must pass the existing metafield GID
-            value: newStock.toString(), // Value must be a string for API
-            type: "number_integer",
-          },
-        ],
+  const writeResponse = await executeAdminQuery(writeMutation, {
+    metafields: [
+      {
+        ownerId: variantData.id,
+        namespace: METADATA_NAMESPACE,
+        key: METADATA_KEY,
+        // The previous error was caused by including 'id: currentMetafield.id' here.
+        // The MetafieldsSetInput type does not accept the metafield's ID.
+        value: newStock.toString(), // Value must be a string for API
+        type: "number_integer",
       },
-    },
-    {
-      headers: {
-        "Content-Type": "application/json",
-        "X-Shopify-Access-Token": SHOPIFY_ADMIN_ACCESS_TOKEN,
-      },
-    }
-  );
+    ],
+  });
 
   const mutationResult = writeResponse.data.data?.metafieldsSet;
-  console.log({ writeResponse: writeResponse.data.errors });
+  console.log({ writeResponseErrors: writeResponse.data.errors });
   if (mutationResult?.userErrors.length > 0) {
     throw new Error(
       "Shopify Metafield Update Error: " +
@@ -175,6 +178,9 @@ app.post("/decrease-variant-stock", async (req, res) => {
     }
 
     // --- STEP A: FIND VARIANT GID (Storefront API) ---
+    // Note: The Storefront API is used here only to resolve the variant GID
+    // from the handle and options, which is generally acceptable for public
+    // read operations, but the final write (decrease stock) uses the Admin API.
     const storefrontQuery = `
       query getProduct($handle: String!) {
         product(handle: $handle) {
@@ -209,6 +215,7 @@ app.post("/decrease-variant-stock", async (req, res) => {
       storefrontResponse.data.data?.product?.variants?.edges || [];
 
     const matchingVariant = variants.find(({ node }) => {
+      // Ensure all requested options match the variant's selected options
       return selectedOptions.every((requestedOption) =>
         node.selectedOptions.some(
           (variantOption) =>
@@ -241,7 +248,7 @@ app.post("/decrease-variant-stock", async (req, res) => {
   } catch (error) {
     const errorMessage = error.message || "An unknown error occurred.";
     // Handle specific errors for clearer feedback
-    if (errorMessage.includes("Not enough stock")) {
+    if (errorMessage.includes("Insufficient stock")) {
       return res.status(409).json({ error: errorMessage });
     }
     if (errorMessage.includes("not found")) {
