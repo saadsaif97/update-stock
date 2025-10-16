@@ -37,114 +37,182 @@ const ADMIN_GRAPHQL_URL = `https://${SHOPIFY_STORE_DOMAIN}/admin/api/${
   SHOPIFY_API_VERSION || "2024-10"
 }/graphql.json`;
 
+// Global Helper to handle Admin API requests
+const executeAdminQuery = async (query, variables) => {
+  try {
+    return await axios.post(
+      ADMIN_GRAPHQL_URL,
+      { query, variables },
+      {
+        headers: {
+          "Content-Type": "application/json",
+          "X-Shopify-Access-Token": SHOPIFY_ADMIN_ACCESS_TOKEN,
+        },
+      }
+    );
+  } catch (e) {
+    console.error("Admin API Error:", e.response?.data?.errors || e.message);
+    // Propagate the error clearly for the caller
+    throw new Error("Failed to communicate with Shopify Admin API.");
+  }
+};
+
+// ----------------------------------------------------------------------
+// CORE HELPER FUNCTIONS
+// ----------------------------------------------------------------------
+
 /**
- * Helper function to decrease the custom.store_stock metafield quantity.
+ * Helper function to fetch the 'available' inventory level for a variant.
  * @param {string} variantGid - The Shopify Global ID of the variant.
- * @param {number} decreaseAmount - The amount to decrease the stock by.
+ * @returns {Promise<number>} - The available stock quantity (aggregated across locations).
  */
-async function decreaseVariantStock(variantGid, decreaseAmount) {
+async function getVariantInventoryLevel(variantGid) {
+  const readInventoryQuery = `
+    query getVariantInventory($id: ID!) {
+      productVariant(id: $id) {
+        id
+        inventoryItem {
+          inventoryLevels(first: 100) {
+            nodes {
+              quantities(names: ["available"]) {
+                quantity
+                name
+              }
+            }
+          }
+        }
+      }
+    }
+  `;
+
+  const readResponse = await executeAdminQuery(readInventoryQuery, {
+    id: variantGid,
+  });
+
+  const variantData = readResponse.data.data?.productVariant;
+
+  if (!variantData) {
+    throw new Error(`Product variant GID ${variantGid} not found.`);
+  }
+
+  const inventoryLevels =
+    variantData.inventoryItem?.inventoryLevels?.nodes || [];
+
+  if (inventoryLevels.length === 0) {
+    console.warn(`No inventory levels found for variant ${variantGid}.`);
+    return 0;
+  }
+
+  // Sum all 'available' quantities across all inventory locations.
+  let totalAvailableStock = 0;
+  for (const level of inventoryLevels) {
+    const availableQuantityNode = level.quantities.find(
+      (q) => q.name === "available"
+    );
+    if (availableQuantityNode) {
+      totalAvailableStock += availableQuantityNode.quantity;
+    }
+  }
+
+  return totalAvailableStock;
+}
+
+/**
+ * Helper function to find a variant GID on a given product handle based on options.
+ * @param {string} handle - The product handle (e.g., 'main-product' or 'main-product-store').
+ * @param {Array<{name: string, value: string}>} selectedOptions - Options to match the variant.
+ * @returns {Promise<string>} - The matching variant's Global ID (GID).
+ */
+async function getVariantGidByOptions(handle, selectedOptions) {
+  const storefrontQuery = `
+    query getProduct($handle: String!) {
+      product(handle: $handle) {
+        variants(first: 100) {
+          edges {
+            node {
+              id
+              selectedOptions {
+                name
+                value
+              }
+            }
+          }
+        }
+      }
+    }
+  `;
+
+  const storefrontResponse = await axios.post(
+    `https://${SHOPIFY_STORE_DOMAIN}/api/2024-10/graphql.json`,
+    { query: storefrontQuery, variables: { handle } },
+    {
+      headers: {
+        "Content-Type": "application/json",
+        "X-Shopify-Storefront-Access-Token": SHOPIFY_STOREFRONT_ACCESS_TOKEN,
+      },
+    }
+  );
+
+  const variants = storefrontResponse.data.data?.product?.variants?.edges || [];
+
+  const matchingVariant = variants.find(({ node }) => {
+    // Check if ALL requested options match the variant's selected options
+    return selectedOptions.every((requestedOption) =>
+      node.selectedOptions.some(
+        (variantOption) =>
+          variantOption.name.toLowerCase() ===
+            requestedOption.name.toLowerCase() &&
+          variantOption.value.toLowerCase() ===
+            requestedOption.value.toLowerCase()
+      )
+    );
+  });
+
+  if (!matchingVariant) {
+    throw new Error(`No matching variant found for product handle '${handle}' with the given options.`);
+  }
+
+  return matchingVariant.node.id;
+}
+
+
+/**
+ * Sets the custom.store_stock metafield on a variant to a new quantity.
+ * @param {string} metafieldOwnerGid - The GID of the variant whose metafield should be updated.
+ * @param {number} newQuantity - The new stock quantity to set.
+ */
+async function setVariantCustomStock(metafieldOwnerGid, newQuantity) {
   const METADATA_NAMESPACE = "custom";
   const METADATA_KEY = "store_stock";
 
-  // --- STEP 1: READ the current metafield value (Admin API) ---
-  const readQuery = `
-        query getMetafield($id: ID!) {
-            productVariant(id: $id) {
-                id
-                metafield(namespace: "${METADATA_NAMESPACE}", key: "${METADATA_KEY}") {
-                    id
-                    value
-                }
-            }
-        }
-    `;
-
-  // Helper to handle API requests with retry logic (omitted for brevity)
-  const executeAdminQuery = async (query, variables) => {
-    try {
-      return await axios.post(
-        ADMIN_GRAPHQL_URL,
-        { query, variables },
-        {
-          headers: {
-            "Content-Type": "application/json",
-            "X-Shopify-Access-Token": SHOPIFY_ADMIN_ACCESS_TOKEN,
-          },
-        }
-      );
-    } catch (e) {
-      console.error("Admin API Error:", e.response?.data?.errors || e.message);
-      throw new Error("Failed to communicate with Shopify Admin API.");
-    }
-  };
-
-
-  const readResponse = await executeAdminQuery(readQuery, { id: variantGid });
-
-  console.log({ readResponse: readResponse.data.data?.productVariant });
-
-  const variantData = readResponse.data.data?.productVariant;
-  const currentMetafield = variantData?.metafield;
-
-  if (!variantData) {
-    throw new Error("Product variant not found using GID.");
-  }
-  if (!currentMetafield) {
-    // If metafield doesn't exist, we can't decrease it. Assuming the stock must be initialized.
-    throw new Error(
-      `Metafield '${METADATA_NAMESPACE}.${METADATA_KEY}' not found on this variant. Cannot proceed with decrease.`
-    );
-  }
-
-  const currentValue = parseInt(currentMetafield.value, 10);
-  if (isNaN(currentValue)) {
-    throw new Error("Metafield value is not a valid integer.");
-  }
-
-  const newStock = currentValue - decreaseAmount;
-
-  if (newStock < 0) {
-    throw new Error(
-      `Insufficient stock (Current: ${currentValue}) to decrease by ${decreaseAmount}.`
-    );
-  }
-
-  // --- STEP 2: WRITE the new metafield value (Admin API) ---
-  // Note: We use metafieldsSet which creates or updates a metafield based on
-  // ownerId, namespace, and key. It does NOT accept the metafield's GID ('id') in the input.
   const writeMutation = `
-  mutation metafieldsSet($metafields: [MetafieldsSetInput!]!) {
-    metafieldsSet(metafields: $metafields) {
-      metafields {
-        id
-        value
-      }
-      userErrors {
-        field
-        message
+    mutation metafieldsSet($metafields: [MetafieldsSetInput!]!) {
+      metafieldsSet(metafields: $metafields) {
+        metafields {
+          id
+          value
+        }
+        userErrors {
+          field
+          message
+        }
       }
     }
-  }
-`;
-
-  console.log({ newStock, currentMetafield, variantData });
+  `;
 
   const writeResponse = await executeAdminQuery(writeMutation, {
     metafields: [
       {
-        ownerId: variantData.id,
+        ownerId: metafieldOwnerGid,
         namespace: METADATA_NAMESPACE,
         key: METADATA_KEY,
-        // The previous error was caused by including 'id: currentMetafield.id' here.
-        // The MetafieldsSetInput type does not accept the metafield's ID.
-        value: newStock.toString(), // Value must be a string for API
+        value: newQuantity.toString(), // Value must be a string for API
         type: "number_integer",
       },
     ],
   });
 
   const mutationResult = writeResponse.data.data?.metafieldsSet;
-  console.log({ writeResponseErrors: writeResponse.data.errors });
   if (mutationResult?.userErrors.length > 0) {
     throw new Error(
       "Shopify Metafield Update Error: " +
@@ -152,120 +220,78 @@ async function decreaseVariantStock(variantGid, decreaseAmount) {
     );
   }
 
-  return { oldStock: currentValue, newStock, decreasedBy: decreaseAmount };
+  return { newStock: newQuantity };
 }
 
+
 // ----------------------------------------------------------------------
-// NEW COMBINED ENDPOINT
+// NEW SYNCHRONIZATION ENDPOINT
 // ----------------------------------------------------------------------
 
-app.post("/decrease-variant-stock", async (req, res) => {
+app.post("/sync-variant-stock", async (req, res) => {
   try {
-    const { handle, selectedOptions, decreaseBy } = req.body;
-    console.log({body: req.body, handle, selectedOptions, decreaseBy})
-    const decreaseAmount = parseInt(decreaseBy, 10) || 1; // Default to 1 if not provided
+    const { handle, selectedOptions } = req.body;
 
     // 1. Basic input validation
     if (!handle || !selectedOptions || !Array.isArray(selectedOptions)) {
       return res.status(400).json({
-        error:
-          "Missing or invalid 'handle' or 'selectedOptions' array in request body.",
+        error: "Missing or invalid 'handle' or 'selectedOptions' array in request body.",
       });
     }
-    if (decreaseAmount <= 0) {
-      return res
-        .status(400)
-        .json({ error: "Decrease amount must be greater than 0." });
-    }
 
-    // --- STEP A: FIND VARIANT GID (Storefront API) ---
-    // Note: The Storefront API is used here only to resolve the variant GID
-    // from the handle and options, which is generally acceptable for public
-    // read operations, but the final write (decrease stock) uses the Admin API.
-    const storefrontQuery = `
-      query getProduct($handle: String!) {
-        product(handle: $handle) {
-          variants(first: 100) {
-            edges {
-              node {
-                id
-                title
-                selectedOptions {
-                  name
-                  value
-                }
-              }
-            }
-          }
-        }
-      }
-    `;
+    const storeHandle = `${handle}-store`;
 
-    const storefrontResponse = await axios.post(
-      `https://${SHOPIFY_STORE_DOMAIN}/api/2024-10/graphql.json`,
-      { query: storefrontQuery, variables: { handle } },
-      {
-        headers: {
-          "Content-Type": "application/json",
-          "X-Shopify-Storefront-Access-Token": SHOPIFY_STOREFRONT_ACCESS_TOKEN,
-        },
-      }
-    );
+    // --- STEP 1: FIND GID OF THE TARGET VARIANT (Metafield Owner) ---
+    // This is the variant whose custom stock we will update.
+    const metafieldOwnerGid = await getVariantGidByOptions(handle, selectedOptions);
+    console.log(`Metafield Owner GID (${handle}): ${metafieldOwnerGid}`);
 
-    const variants =
-      storefrontResponse.data.data?.product?.variants?.edges || [];
+    // --- STEP 2: FIND GID OF THE SOURCE VARIANT (Inventory Source) ---
+    // This is the variant whose actual inventory we will read.
+    const inventorySourceGid = await getVariantGidByOptions(storeHandle, selectedOptions);
+    console.log(`Inventory Source GID (${storeHandle}): ${inventorySourceGid}`);
 
-    const matchingVariant = variants.find(({ node }) => {
-      // Ensure all requested options match the variant's selected options
-      return selectedOptions.every((requestedOption) =>
-        node.selectedOptions.some(
-          (variantOption) =>
-            variantOption.name.toLowerCase() ===
-              requestedOption.name.toLowerCase() &&
-            variantOption.value.toLowerCase() ===
-              requestedOption.value.toLowerCase()
-        )
-      );
-    });
+    // --- STEP 3: FETCH AVAILABLE INVENTORY FROM SOURCE ---
+    const availableStock = await getVariantInventoryLevel(inventorySourceGid);
+    console.log(`Available Stock from source: ${availableStock}`);
 
-    if (!matchingVariant) {
-      return res
-        .status(404)
-        .json({ error: "No matching variant found for the given options." });
-    }
-
-    const variantGid = matchingVariant.node.id;
-
-    // --- STEP B: DECREASE STOCK (Admin API) ---
-    const stockUpdate = await decreaseVariantStock(variantGid, decreaseAmount);
+    // --- STEP 4: UPDATE CUSTOM METAFIELD ON TARGET ---
+    const updateResult = await setVariantCustomStock(metafieldOwnerGid, availableStock);
 
     res.json({
-      message: "Variant stock successfully found and decreased.",
-      variantGid: variantGid,
+      message: "Variant custom stock successfully synchronized from Shopify inventory to custom metafield.",
       productHandle: handle,
+      inventorySourceHandle: storeHandle,
       options: selectedOptions,
-      ...stockUpdate,
+      metafieldOwnerGid: metafieldOwnerGid,
+      ...updateResult,
     });
   } catch (error) {
     const errorMessage = error.message || "An unknown error occurred.";
+
     // Handle specific errors for clearer feedback
-    if (errorMessage.includes("Insufficient stock")) {
-      return res.status(409).json({ error: errorMessage });
-    }
     if (errorMessage.includes("not found")) {
       return res.status(404).json({ error: errorMessage });
     }
 
     console.error(
-      "Server Error:",
+      "Server Error in /sync-variant-stock:",
       error.response?.data?.errors || errorMessage
     );
     res.status(500).json({
-      error: "Server error during stock operation.",
+      error: "Server error during stock synchronization.",
       details: errorMessage,
     });
   }
 });
+
+
+// ----------------------------------------------------------------------
+// REMAINING ROUTES
+// ----------------------------------------------------------------------
+
+// The original decrease endpoint is removed for simplicity,
+// but you can integrate this new sync logic into it if needed.
 
 app.get("/", (req, res) => {
   res.status(200).json({
