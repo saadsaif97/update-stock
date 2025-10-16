@@ -53,7 +53,7 @@ const executeAdminQuery = async (query, variables) => {
   } catch (e) {
     // === TEMPORARY DEBUGGING CODE ===
     const errorDetails = e.response
-      ? `Status: ${e.response.status}, Errors: ${JSON.stringify(e.response.data.errors)}`
+      ? `Status: ${e.response.status}, Errors: ${JSON.stringify(e)}`
       : e.message;
     console.error("Admin API Fatal Error Details:", errorDetails);
     // === END DEBUGGING CODE ===
