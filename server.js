@@ -34,7 +34,7 @@ if (!SHOPIFY_ADMIN_ACCESS_TOKEN) {
 
 // Admin GraphQL endpoint URL
 const ADMIN_GRAPHQL_URL = `https://${SHOPIFY_STORE_DOMAIN}/admin/api/${
-  SHOPIFY_API_VERSION || "2024-10"
+  (SHOPIFY_API_VERSION || "2024-10").replace(/"/g, '').replace(/'/g, '')
 }/graphql.json`;
 
 // Global Helper to handle Admin API requests
