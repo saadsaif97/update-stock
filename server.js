@@ -266,6 +266,12 @@ app.post("/decrease-variant-stock", async (req, res) => {
   }
 });
 
+app.get("/", (req, res) => {
+  res.status(200).json({
+    message: "Hi!!!!!!"
+  })
+})
+
 // Start the server
 const PORT = 3000;
 app.listen(PORT, () =>
