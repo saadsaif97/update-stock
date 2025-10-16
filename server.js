@@ -161,6 +161,7 @@ async function decreaseVariantStock(variantGid, decreaseAmount) {
 
 app.post("/decrease-variant-stock", async (req, res) => {
   try {
+    console.log({body: req.body})
     const { handle, selectedOptions, decreaseBy } = req.body;
     const decreaseAmount = parseInt(decreaseBy, 10) || 1; // Default to 1 if not provided
 
