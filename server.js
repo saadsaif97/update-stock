@@ -51,8 +51,15 @@ const executeAdminQuery = async (query, variables) => {
       }
     );
   } catch (e) {
+    // === TEMPORARY DEBUGGING CODE ===
+    const errorDetails = e.response
+      ? `Status: ${e.response.status}, Errors: ${JSON.stringify(e.response.data.errors)}`
+      : e.message;
+    console.error("Admin API Fatal Error Details:", errorDetails);
+    // === END DEBUGGING CODE ===
+
     console.error("Admin API Error:", e.response?.data?.errors || e.message);
-    // Propagate the error clearly for the caller
+    // This is the error message returned to the Shopify Flow
     throw new Error("Failed to communicate with Shopify Admin API.");
   }
 };
